@@ -1,7 +1,9 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    fs, io,
+    fs,
+    hash::Hash,
+    io,
     os::{
         fd::{AsFd as _, AsRawFd as _},
         raw::c_int,
@@ -133,6 +135,7 @@ pub struct EbpfLoader<'a> {
     btf: Option<Cow<'a, Btf>>,
     map_pin_path: Option<PathBuf>,
     globals: HashMap<&'a str, (&'a [u8], bool)>,
+    mandatory_pins: HashSet<&'a str>,
     max_entries: HashMap<&'a str, u32>,
     extensions: HashSet<&'a str>,
     verifier_log_level: VerifierLogLevel,
@@ -172,6 +175,7 @@ impl<'a> EbpfLoader<'a> {
             map_pin_path: None,
             globals: HashMap::new(),
             max_entries: HashMap::new(),
+            mandatory_pins: HashSet::new(),
             extensions: HashSet::new(),
             verifier_log_level: VerifierLogLevel::default(),
             allow_unsupported_maps: false,
@@ -337,6 +341,21 @@ impl<'a> EbpfLoader<'a> {
         self
     }
 
+    /// Sets the map as a mandatory pin.
+    /// # Example
+    /// ```no_run
+    /// use aya::EbpfLoader;
+    ///
+    /// let bpf = EbpfLoader::new()
+    ///     .set_mandatory_pins("map")
+    ///     .load_file("file.o")?;
+    /// # Ok::<(), aya::EbpfError>(())
+    /// ```
+    pub fn set_mandatory_pins(&mut self, name: &'a str) -> &mut Self {
+        self.mandatory_pins.insert(name);
+        self
+    }
+
     /// Sets BPF verifier log level.
     ///
     /// # Example
@@ -391,6 +410,7 @@ impl<'a> EbpfLoader<'a> {
             map_pin_path,
             globals,
             max_entries,
+            mandatory_pins,
             extensions,
             verifier_log_level,
             allow_unsupported_maps,
@@ -494,7 +514,17 @@ impl<'a> EbpfLoader<'a> {
             }
             let btf_fd = btf_fd.as_deref().map(|fd| fd.as_fd());
             let mut map = match obj.pinning() {
-                PinningType::None => MapData::create(obj, &name, btf_fd)?,
+                PinningType::None => {
+                    if mandatory_pins.contains(name.as_str()) {
+                        let path = map_pin_path
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new("/sys/fs/bpf"));
+
+                        MapData::create_pinned_by_name(path, obj, &name, btf_fd)?
+                    } else {
+                        MapData::create(obj, &name, btf_fd)?
+                    }
+                }
                 PinningType::ByName => {
                     // pin maps in /sys/fs/bpf by default to align with libbpf
                     // behavior https://github.com/libbpf/libbpf/blob/v1.2.2/src/libbpf.c#L2161.
